@@ -41,6 +41,15 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d);
  * and must not be mistaken for their absence. Guest RAM is one MemoryRegion, so
  * after the first tracked surface of a boot no harvest enables anything and the
  * window is one.
+ *
+ * That harvest does not wait for a guest doorbell. track (and every generation
+ * read that comes back 0) schedules a main-loop bottom half that runs the same
+ * harvest under the BQL, so the window is bounded by the main loop's latency
+ * and not by how long the guest stays away from the device. It cannot be
+ * closed inside this call: the drain thread calls it, the accelerator's
+ * dirty-log sync needs the BQL, and a generation read before that sync would
+ * either vouch for pages whose bits have not been folded in or pretend the
+ * stale bits were a write.
  */
 uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
                                 size_t count, size_t page_size);

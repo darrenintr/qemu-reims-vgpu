@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "qemu/rcu.h"
+#include "qemu/main-loop.h"
 #include "exec/target_page.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
@@ -87,7 +88,50 @@ struct ReimsVgpuDirty {
      * writes into one sync.
      */
     uint64_t reads_since_harvest;
+    /*
+     * Runs a harvest on the main loop, under the BQL, without a guest doorbell.
+     * Scheduled whenever a set exists whose generation still reads 0 — that is,
+     * by `reims_vgpu_dirty_track` and by every generation read that came back 0
+     * — and rescheduled by its own callback while some set is still waiting on
+     * a second harvest. `qemu_bh_schedule` is thread-safe and idempotent while
+     * the bottom half is pending, so the drain thread may call it as often as it
+     * reads.
+     */
+    QEMUBH *arm_bh;
 };
+
+static bool reims_vgpu_dirty_run(ReimsVgpuDirty *d, bool force);
+
+/*
+ * A set is waiting to arm: ask the main loop for the harvest that arms it.
+ *
+ * Arming used to be a side effect of the next *guest doorbell write* that
+ * followed a generation read (`reims_vgpu_dirty_harvest` was called from nowhere
+ * else). A set tracked while the guest is quiet — or inside one long drain
+ * tranche, which drains the work of a single doorbell — therefore read 0 for as
+ * long as the guest stayed away from the device: measured at up to 8.24 s, with
+ * the window re-gathered on every bind.
+ *
+ * Any thread.
+ */
+static void reims_vgpu_dirty_want_arm(ReimsVgpuDirty *d)
+{
+    if (d->arm_bh) {
+        qemu_bh_schedule(d->arm_bh);
+    }
+}
+
+static void reims_vgpu_dirty_arm_bh(void *opaque)
+{
+    ReimsVgpuDirty *d = opaque;
+
+    /* BQL held: main-loop bottom halves run under it. Forced, because the
+     * harvest this stands in for was owed by a set, not by a generation read
+     * that may already have been consumed. */
+    if (reims_vgpu_dirty_run(d, true)) {
+        reims_vgpu_dirty_want_arm(d);
+    }
+}
 
 static void reims_vgpu_dirty_set_free(gpointer p)
 {
@@ -106,6 +150,7 @@ ReimsVgpuDirty *reims_vgpu_dirty_new(void)
     d->sets = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                     reims_vgpu_dirty_set_free);
     d->logged = g_hash_table_new(NULL, NULL);
+    d->arm_bh = aio_bh_new(qemu_get_aio_context(), reims_vgpu_dirty_arm_bh, d);
     return d;
 }
 
@@ -116,6 +161,12 @@ void reims_vgpu_dirty_free(ReimsVgpuDirty *d)
 
     if (!d) {
         return;
+    }
+    /* Before anything it could touch is torn down; the BQL is held, so the
+     * callback is not running. */
+    if (d->arm_bh) {
+        qemu_bh_delete(d->arm_bh);
+        d->arm_bh = NULL;
     }
     /* BQL: memory_region_set_log is a MemoryRegion transaction. */
     g_hash_table_iter_init(&it, d->logged);
@@ -235,7 +286,21 @@ uint64_t reims_vgpu_dirty_track(ReimsVgpuDirty *d, const uint64_t *gpas,
     d->next_token++;
     token = d->next_token;
     g_hash_table_insert(d->sets, g_memdup2(&token, sizeof(token)), s);
+    /*
+     * A new set is a consumer the next harvest has something to tell, whether
+     * or not a generation read has followed yet: without this a harvest that
+     * nothing has read since the last one is skipped, and the set would wait
+     * for a reader as well as for a harvest.
+     */
+    d->reads_since_harvest++;
     qemu_mutex_unlock(&d->lock);
+    /*
+     * The harvest that arms this set must not wait for the guest to ring a
+     * doorbell. It cannot run here: track is called from the drain thread,
+     * which must never take the BQL, and the accelerator's dirty-log sync needs
+     * it. The main loop can, and it is the same function the doorbell calls.
+     */
+    reims_vgpu_dirty_want_arm(d);
     return token;
 }
 
@@ -253,6 +318,7 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
 {
     ReimsVgpuDirtySet *s;
     uint64_t gen = 0;
+    bool unarmed = false;
 
     if (!d || token == 0) {
         return 0;
@@ -261,9 +327,16 @@ uint64_t reims_vgpu_dirty_gen(ReimsVgpuDirty *d, uint64_t token)
     s = g_hash_table_lookup(d->sets, &token);
     if (s) {
         gen = s->gen;
+        unarmed = gen == 0;
     }
     d->reads_since_harvest++;
     qemu_mutex_unlock(&d->lock);
+    if (unarmed) {
+        /* Idempotent while pending. Asked on every unarmed read, not just at
+         * track, so a wakeup that was consumed before this set could arm (it
+         * needed a second harvest) is never the last one. */
+        reims_vgpu_dirty_want_arm(d);
+    }
     return gen;
 }
 
@@ -436,6 +509,18 @@ static bool reims_vgpu_dirty_page_written(const ReimsVgpuDirtySlice *sl,
 
 void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
 {
+    reims_vgpu_dirty_run(d, false);
+}
+
+/*
+ * One harvest. Returns whether a set is still unarmed afterwards, i.e. whether
+ * another harvest is owed to it. `force` skips the "nothing has read since the
+ * last harvest" shortcut, which is a statement about generation readers and
+ * does not apply to a harvest a waiting set asked for.
+ */
+static bool reims_vgpu_dirty_run(ReimsVgpuDirty *d, bool force)
+{
+    bool pending = false;
     ReimsVgpuDirtySlice *slices;
     g_autoptr(GArray) written = NULL;
     g_autoptr(GArray) hit = NULL;
@@ -445,13 +530,14 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
     guint w;
 
     if (!d) {
-        return;
+        return false;
     }
 
     qemu_mutex_lock(&d->lock);
-    if (g_hash_table_size(d->sets) == 0 || d->reads_since_harvest == 0) {
+    if (g_hash_table_size(d->sets) == 0 ||
+        (!force && d->reads_since_harvest == 0)) {
         qemu_mutex_unlock(&d->lock);
-        return;
+        return false;
     }
     qemu_mutex_unlock(&d->lock);
 
@@ -554,6 +640,9 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
         } else if (any) {
             s->gen++;
         }
+        if (s->gen == 0) {
+            pending = true;
+        }
         /*
          * Stamp after the generation, and only once it is readable. A page
          * stamped during the startup window would carry a generation no reader
@@ -638,4 +727,5 @@ void reims_vgpu_dirty_harvest(ReimsVgpuDirty *d)
             memory_region_set_log(slices[i].mr, true, DIRTY_MEMORY_VGA);
         }
     }
+    return pending;
 }
