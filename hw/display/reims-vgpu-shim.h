@@ -63,6 +63,15 @@ int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
                                       size_t max);
 
 /*
+ * The file behind guest RAM at [host_va, host_va + len), and the offset of
+ * host_va in it. See ReimsVgpuHostOps.guest_ram_fd in reims_vgpu_qemu_abi.h.
+ * Bus-independent for the same reason as guest_ram_regions: it reads RAMBlocks,
+ * not the device, so both shims point at this one copy.
+ */
+int reims_vgpu_shim_guest_ram_fd(void *ctx, uint64_t host_va, uint64_t len,
+                                 int *fd, uint64_t *offset);
+
+/*
  * Guest kernel VA -> host buffer, for MappingInternal / page-table walks.
  *
  * MUST run on a vCPU thread with current_cpu set (typically the iosfc

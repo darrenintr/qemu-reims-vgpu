@@ -11,6 +11,7 @@
 #include "system/address-spaces.h"
 #include "system/hw_accel.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "reims_vgpu_qemu_abi.h"
@@ -197,6 +198,44 @@ int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
         return REIMS_VGPU_GUEST_RAM_ERR_ARGS;
     }
     return (int)scan.found;
+}
+
+int reims_vgpu_shim_guest_ram_fd(void *ctx, uint64_t host_va, uint64_t len,
+                                 int *fd, uint64_t *offset)
+{
+    RAMBlock *rb;
+    ram_addr_t in_block = 0;
+    int block_fd;
+    int rc;
+
+    (void)ctx;
+    if (!fd || !offset || len == 0 || host_va > UINT64_MAX - len) {
+        return REIMS_VGPU_GUEST_RAM_ERR_ARGS;
+    }
+    rcu_read_lock();
+    rb = qemu_ram_block_from_host((void *)(uintptr_t)host_va, false, &in_block);
+    if (!rb) {
+        rc = REIMS_VGPU_GUEST_RAM_ERR_ARGS;
+    } else if (in_block > qemu_ram_get_used_length(rb) ||
+               len > qemu_ram_get_used_length(rb) - in_block) {
+        /*
+         * The whole range must be this one block's: a caller that imports the
+         * file over a range running past the block would name bytes of the file
+         * that are not this guest memory, or no bytes at all.
+         */
+        rc = REIMS_VGPU_GUEST_RAM_ERR_ARGS;
+    } else {
+        block_fd = qemu_ram_get_fd(rb);
+        if (block_fd < 0) {
+            rc = REIMS_VGPU_GUEST_RAM_FD_NONE;
+        } else {
+            *fd = block_fd;
+            *offset = qemu_ram_get_fd_offset(rb) + in_block;
+            rc = 0;
+        }
+    }
+    rcu_read_unlock();
+    return rc;
 }
 
 int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)

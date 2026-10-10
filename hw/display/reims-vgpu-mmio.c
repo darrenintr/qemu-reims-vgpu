@@ -1003,6 +1003,7 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
          * keep alive until teardown.
          */
         .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
+        .guest_ram_fd = reims_vgpu_shim_guest_ram_fd,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         /*
          * 0: a fragmented list gets a packed mach_vm_remap view whose lifetime

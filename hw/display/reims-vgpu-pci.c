@@ -38,11 +38,6 @@
 #define TYPE_REIMS_VGPU_PCI "reims-vgpu-pci"
 OBJECT_DECLARE_SIMPLE_TYPE(ReimsVGPUPCIState, REIMS_VGPU_PCI)
 
-typedef struct ReimsVGPUPCIPageView {
-    void *ptr;
-    size_t len;
-} ReimsVGPUPCIPageView;
-
 /*
  * BAR0 = full gfx window; control block at +0x1000. The size is the shared
  * REIMS_VGPU_GFX_MMIO_SIZE — Rust bounds its register store against the same
@@ -103,8 +98,13 @@ struct ReimsVGPUPCIState {
     /* Caller-owned packed aliases over file-backed guest pages. Direct
      * RAMBlock pointers never enter this list; constructed views leave through
      * unmap_pages when the Rust mapping lifetime ends, with device exit as the
-     * final safety net. */
-    GArray *page_views;
+     * final safety net.
+     *
+     * Keyed by the view's address, valued by its length: unmap_pages runs once
+     * per page run of every CPU frame write, and most of those calls carry a
+     * direct RAMBlock pointer that is *not* here. A list scanned to the end on
+     * every such miss cost a third of the device's CPU on a 1080p clear. */
+    GHashTable *page_views;
     uint64_t page_view_live_bytes;
     uint64_t page_view_live_pages;
     uint64_t page_views_created;
@@ -269,8 +269,6 @@ fail:
         size_t total = count * page;
         uint8_t *view = mmap(NULL, total, PROT_NONE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        ReimsVGPUPCIPageView held;
-
         if (view == MAP_FAILED) {
             failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_RESERVATION;
             failure->host_errno = errno;
@@ -325,9 +323,7 @@ fail:
         }
         rcu_read_unlock();
 
-        held.ptr = view;
-        held.len = total;
-        g_array_append_val(s->page_views, held);
+        g_hash_table_insert(s->page_views, view, GSIZE_TO_POINTER(total));
         s->page_view_live_bytes += total;
         s->page_view_live_pages += count;
         s->page_views_created++;
@@ -345,27 +341,21 @@ alias_fail_locked:
 static void reims_vgpu_pci_unmap_pages(void *ctx, void *ptr, size_t len)
 {
     ReimsVGPUPCIState *s = ctx;
-    size_t i;
+    gpointer held_len;
 
     if (!s || !s->page_views || !ptr || len == 0) {
         return;
     }
-
-    for (i = 0; i < s->page_views->len; i++) {
-        ReimsVGPUPCIPageView *view =
-            &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
-
-        if (view->ptr != ptr || view->len != len) {
-            continue;
-        }
-        munmap(view->ptr, view->len);
-        s->page_view_live_bytes -= view->len;
-        s->page_view_live_pages -= view->len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
-        s->page_views_destroyed++;
-        g_array_remove_index_fast(s->page_views, i);
+    /* A direct RAMBlock pointer is borrowed from QEMU and has no entry. */
+    if (!g_hash_table_lookup_extended(s->page_views, ptr, NULL, &held_len) ||
+        GPOINTER_TO_SIZE(held_len) != len) {
         return;
     }
-    /* A direct RAMBlock pointer is borrowed from QEMU and has no entry. */
+    munmap(ptr, len);
+    s->page_view_live_bytes -= len;
+    s->page_view_live_pages -= len >> REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64;
+    s->page_views_destroyed++;
+    g_hash_table_remove(s->page_views, ptr);
 }
 
 static int reims_vgpu_pci_page_alias_census(
@@ -377,7 +367,7 @@ static int reims_vgpu_pci_page_alias_census(
         return -1;
     }
     *out = (ReimsVgpuPageAliasCensus) {
-        .live = s->page_views->len,
+        .live = g_hash_table_size(s->page_views),
         .live_bytes = s->page_view_live_bytes,
         .live_pages = s->page_view_live_pages,
         .created = s->page_views_created,
@@ -1056,6 +1046,7 @@ static void reims_vgpu_pci_realize(PCIDevice *pdev, Error **errp)
          * bus-specific lifetime for a shim to own.
          */
         .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
+        .guest_ram_fd = reims_vgpu_shim_guest_ram_fd,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         .notify_actions = reims_vgpu_pci_notify_actions,
         /*
@@ -1175,17 +1166,17 @@ static void reims_vgpu_pci_exit(PCIDevice *pdev)
     }
     reims_vgpu_pci_stop_backend(s);
     if (s->page_views) {
-        size_t i;
+        GHashTableIter iter;
+        gpointer view, view_len;
 
-        for (i = 0; i < s->page_views->len; i++) {
-            ReimsVGPUPCIPageView *view =
-                &g_array_index(s->page_views, ReimsVGPUPCIPageView, i);
+        g_hash_table_iter_init(&iter, s->page_views);
+        while (g_hash_table_iter_next(&iter, &view, &view_len)) {
 #ifndef _WIN32
-            munmap(view->ptr, view->len);
+            munmap(view, GPOINTER_TO_SIZE(view_len));
             s->page_views_destroyed++;
 #endif
         }
-        g_array_free(s->page_views, true);
+        g_hash_table_destroy(s->page_views);
         s->page_views = NULL;
     }
     /* After the drain thread is joined: reims_vgpu_dirty_free turns region
@@ -1235,7 +1226,7 @@ static void reims_vgpu_pci_instance_init(Object *obj)
 
     /* Required before realize so config space is PCIe-sized (4 KiB). */
     pdev->cap_present |= QEMU_PCI_CAP_EXPRESS;
-    s->page_views = g_array_new(false, false, sizeof(ReimsVGPUPCIPageView));
+    s->page_views = g_hash_table_new(g_direct_hash, g_direct_equal);
 }
 
 static void reims_vgpu_pci_class_init(ObjectClass *klass, const void *data)
