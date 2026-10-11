@@ -261,12 +261,19 @@ fail:
      * one MAP_SHARED view. This is an alias, not a copy: guest CPU writes and
      * GPU reads still address the same pages.
      *
-     * Reserve the complete range first, then replace it page by page. A failed
-     * page tears down the whole reservation, so callers never receive a
-     * partially packed view.
+     * Reserve the complete range first, then replace it one file run at a
+     * time: consecutive pages that continue the same file at the next offset
+     * share one mmap. The guest backs surfaces in physically contiguous
+     * granules, so a run is typically four pages, and a view used to cost one
+     * mmap, one kernel mapping and one later unmap per page. A failed run tears
+     * down the whole reservation, so callers never receive a partially packed
+     * view.
      */
     {
         size_t total = count * page;
+        size_t run_start = 0;
+        int run_fd = -1;
+        ram_addr_t run_fd_offset = 0;
         uint8_t *view = mmap(NULL, total, PROT_NONE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (view == MAP_FAILED) {
@@ -275,51 +282,65 @@ fail:
             return -1;
         }
         rcu_read_lock();
-        for (i = 0; i < count; i++) {
+        for (i = 0; i <= count; i++) {
             hwaddr xlat, plen = page;
             MemoryRegion *mr;
             uint8_t *hva;
             RAMBlock *rb;
             ram_addr_t rb_offset;
-            ram_addr_t fd_offset;
-            int fd;
+            ram_addr_t fd_offset = 0;
+            int fd = -1;
             void *mapped;
 
-            mr = address_space_translate(&address_space_memory, gpas[i],
-                                         &xlat, &plen, true,
-                                         MEMTXATTRS_UNSPECIFIED);
-            if (!mr || !memory_region_is_ram(mr) || plen < page) {
-                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
-                failure->page_index = i;
-                goto alias_fail_locked;
+            if (i < count) {
+                mr = address_space_translate(&address_space_memory, gpas[i],
+                                             &xlat, &plen, true,
+                                             MEMTXATTRS_UNSPECIFIED);
+                if (!mr || !memory_region_is_ram(mr) || plen < page) {
+                    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_INVALID_GUEST_PAGE;
+                    failure->page_index = i;
+                    goto alias_fail_locked;
+                }
+                hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+                rb = qemu_ram_block_from_host(hva, false, &rb_offset);
+                if (!rb || !qemu_ram_is_shared(rb)) {
+                    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+                    failure->page_index = i;
+                    goto alias_fail_locked;
+                }
+                fd = qemu_ram_get_fd(rb);
+                if (fd < 0 ||
+                    rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
+                    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+                    failure->page_index = i;
+                    goto alias_fail_locked;
+                }
+                fd_offset = qemu_ram_get_fd_offset(rb) + rb_offset;
+                if ((fd_offset & (page - 1)) != 0) {
+                    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+                    failure->page_index = i;
+                    goto alias_fail_locked;
+                }
+                if (i > run_start && fd == run_fd &&
+                    fd_offset == run_fd_offset + (i - run_start) * page) {
+                    continue; /* this page extends the open run */
+                }
             }
-            hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
-            rb = qemu_ram_block_from_host(hva, false, &rb_offset);
-            if (!rb || !qemu_ram_is_shared(rb)) {
-                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
-                failure->page_index = i;
-                goto alias_fail_locked;
+            /* Page i starts a new run (or the list ended): map the open one. */
+            if (i > run_start) {
+                mapped = mmap(view + run_start * page, (i - run_start) * page,
+                              PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                              run_fd, run_fd_offset);
+                if (mapped == MAP_FAILED) {
+                    failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
+                    failure->host_errno = errno;
+                    failure->page_index = run_start;
+                    goto alias_fail_locked;
+                }
             }
-            fd = qemu_ram_get_fd(rb);
-            if (fd < 0 || rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
-                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
-                failure->page_index = i;
-                goto alias_fail_locked;
-            }
-            fd_offset = qemu_ram_get_fd_offset(rb) + rb_offset;
-            if ((fd_offset & (page - 1)) != 0) {
-                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
-                failure->page_index = i;
-                goto alias_fail_locked;
-            }
-            mapped = mmap(view + i * page, page, PROT_READ | PROT_WRITE,
-                          MAP_SHARED | MAP_FIXED, fd, fd_offset);
-            if (mapped == MAP_FAILED) {
-                failure->stage = REIMS_VGPU_MAP_PAGES_FAILURE_ALIAS;
-                failure->host_errno = errno;
-                failure->page_index = i;
-                goto alias_fail_locked;
-            }
+            run_start = i;
+            run_fd = fd;
+            run_fd_offset = fd_offset;
         }
         rcu_read_unlock();
 
