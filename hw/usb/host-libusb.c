@@ -1268,6 +1268,21 @@ static void usb_host_unrealize(USBDevice *udev)
     qemu_remove_exit_notifier(&s->exit);
     QTAILQ_REMOVE(&hostdevs, s, next);
     usb_host_close(s);
+    /*
+     * Delete bottom halves after usb_host_close().  During close,
+     * libusb callbacks (usb_host_req_complete_ctrl/data) can call
+     * usb_host_nodev() which lazily creates bh_nodev.  If we
+     * deleted them before close, a newly created BH would leak and
+     * fire after unrealize, dereferencing freed USBHostDevice.
+     */
+    if (s->bh_nodev) {
+        qemu_bh_delete(s->bh_nodev);
+        s->bh_nodev = NULL;
+    }
+    if (s->bh_postld) {
+        qemu_bh_delete(s->bh_postld);
+        s->bh_postld = NULL;
+    }
 }
 
 static void usb_host_cancel_packet(USBDevice *udev, USBPacket *p)
@@ -1520,6 +1535,13 @@ static void usb_host_handle_control(USBDevice *udev, USBPacket *p,
                                  CONTROL_TIMEOUT);
     rc = libusb_submit_transfer(r->xfer);
     if (rc != 0) {
+        /*
+         * Free the request to avoid a dangling r->p pointer.
+         * When libusb_submit_transfer fails the caller (xHCI) may
+         * free the XHCITransfer that holds the USBPacket r->p points
+         * to, so we must remove r from s->requests before returning.
+         */
+        usb_host_req_free(r);
         p->status = USB_RET_NODEV;
         trace_usb_host_req_complete(s->bus_num, s->addr, p,
                                     p->status, p->actual_length);
@@ -1614,6 +1636,13 @@ static void usb_host_handle_data(USBDevice *udev, USBPacket *p)
 
     rc = libusb_submit_transfer(r->xfer);
     if (rc != 0) {
+        /*
+         * Free the request to avoid a dangling r->p pointer.
+         * When libusb_submit_transfer fails the caller (xHCI) may
+         * free the XHCITransfer that holds the USBPacket r->p points
+         * to, so we must remove r from s->requests before returning.
+         */
+        usb_host_req_free(r);
         p->status = USB_RET_NODEV;
         trace_usb_host_req_complete(s->bus_num, s->addr, p,
                                     p->status, p->actual_length);
